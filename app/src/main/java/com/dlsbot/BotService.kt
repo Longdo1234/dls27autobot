@@ -3,11 +3,14 @@ package com.dlsbot
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.*
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.view.*
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -20,10 +23,14 @@ import kotlin.random.Random
 
 class BotService : AccessibilityService() {
     private val io = Executors.newSingleThreadExecutor()
+    private val ui = Handler(Looper.getMainLooper())
+    private var tv: TextView? = null
     @Volatile private var running = false
     private lateinit var wm: WindowManager
     private val prefs get() = getSharedPreferences("cfg", MODE_PRIVATE)
     private val D = arrayOf(.12f to .72f, .72f to .82f, .82f to .68f, .9f to .86f)
+
+    private fun status(s: String) { ui.post { tv?.text = s } }
 
     override fun onServiceConnected() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -36,6 +43,8 @@ class BotService : AccessibilityService() {
         }
         l.addView(go)
         l.addView(Button(this).apply { text = "⚙"; setOnClickListener { showSetup() } })
+        tv = TextView(this).apply { setTextColor(Color.WHITE); textSize = 11f; maxLines = 2; maxWidth = 600; text = "Sẵn sàng" }
+        l.addView(tv)
         wm.addView(l, WindowManager.LayoutParams(-2, -2, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START })
     }
@@ -86,25 +95,33 @@ class BotService : AccessibilityService() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT))
     }
 
-    // Mỗi lần gọi AI (cách nhau >= 4,3 giây để không vượt hạn mức miễn phí) AI trả về 3 nước đi, bot làm lần lượt
     private fun loop() {
         var last = "start"
         var t0 = 0L
         while (running) {
-            val wait = 4300 - (System.currentTimeMillis() - t0)
-            if (wait > 0) Thread.sleep(wait)
-            t0 = System.currentTimeMillis()
-            val img = shoot()
-            val plan = if (img != null) Ai.decide(prefs.getString("key", "") ?: "", img, last) else null
-            if (plan == null) { Thread.sleep(1500); continue }
-            last = plan.toString()
-            for (i in 0 until plan.length()) {
-                if (!running) break
-                val s = plan.getJSONObject(i)
-                act(s)
-                Thread.sleep(s.optLong("ms", 900).coerceIn(500, 1500) + Random.nextLong(30, 150))
+            try {
+                val wait = 4300 - (System.currentTimeMillis() - t0)
+                if (wait > 0) Thread.sleep(wait)
+                t0 = System.currentTimeMillis()
+                status("Đang chụp màn hình...")
+                val img = shoot()
+                if (img == null) { status("Chụp màn hình lỗi"); Thread.sleep(1500); continue }
+                status("Đang hỏi AI...")
+                val (plan, msg) = Ai.decide(prefs.getString("key", "") ?: "", img, last)
+                if (plan == null) { status(msg); Thread.sleep(1500); continue }
+                last = plan.toString()
+                for (i in 0 until plan.length()) {
+                    if (!running) break
+                    val s = plan.getJSONObject(i)
+                    status("Bước ${i + 1}/${plan.length()}: nút ${s.optString("btn")}, góc ${s.optInt("angle")}")
+                    act(s)
+                    Thread.sleep(s.optLong("ms", 900).coerceIn(500, 1500) + Random.nextLong(30, 150))
+                }
+            } catch (e: Exception) {
+                status(("Lỗi: " + e.message).take(80)); Thread.sleep(1500)
             }
         }
+        status("Đã dừng")
     }
 
     private fun shoot(): String? {
@@ -121,7 +138,7 @@ class BotService : AccessibilityService() {
                 } catch (e: Exception) {}
                 latch.countDown()
             }
-            override fun onFailure(code: Int) { latch.countDown() }
+            override fun onFailure(code: Int) { status("Chụp lỗi, mã $code"); latch.countDown() }
         })
         latch.await(3, java.util.concurrent.TimeUnit.SECONDS)
         return out
@@ -150,31 +167,49 @@ class BotService : AccessibilityService() {
             g.addStroke(GestureDescription.StrokeDescription(
                 Path().apply { moveTo(bx + rn(6f), by + rn(6f)) }, Random.nextLong(60, 250), hold.coerceAtLeast(40)))
         }
-        dispatchGesture(g.build(), null, null)
+        val ok = dispatchGesture(g.build(), object : GestureResultCallback() {
+            override fun onCancelled(d: GestureDescription?) { status("Cử chỉ bị hủy") }
+        }, null)
+        if (!ok) status("Hệ thống từ chối cử chỉ")
     }
 }
 
 object Ai {
-    private const val MODEL = "gemini-2.5-flash-lite"
-    private const val SYS = """You play Dream League Soccer on a phone through screenshots. Find the ball, the player you control (highlighted), teammates, opponents and both goals; work out which way your team attacks and which part of the pitch you are in.
-Controls: joystick moves the player. A = short pass, B = shoot (hold longer = more power / long ball), C = sprint. When defending: chase the ball carrier, hold C to sprint, tap A to switch player or tackle. When attacking: carry the ball toward goal, dribble (zigzag) past defenders, pass to a free teammate, shoot when near the box with a clear angle.
-Plan the next 3 moves in order (the game keeps moving, so keep each move simple). Reply ONLY with JSON: {"steps":[{"angle":0-359 screen direction for the joystick (0=right,90=up,180=left,270=down),"power":0.3-1,"dribble":true/false,"btn":"A"|"B"|"C"|"none","hold":0-600 ms (for B),"ms":600-1400 how long this move lasts}, ...3 items...],"note":"3-word tactic"}"""
+    private val MODELS = arrayOf("gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash")
+    @Volatile private var mi = 0
+    private const val SYS = """You play Dream League Soccer on a phone through screenshots. Shirt colors and sides change every match, so work them out from each screenshot instead of assuming.
+Who is who: the player you control has a marker (arrow or ring) above or under him. His teammates wear the same shirt color as him; players in the other color are opponents. Goalkeepers wear a different color from their outfield players.
+Which way to attack: you attack the goal guarded by the opponents (their goalkeeper and defenders stand near it); your own goalkeeper and defenders guard the other goal. Teams swap sides at half time. If you cannot tell, keep the direction from the previous plan; if there is none, chase the ball and do not shoot yet.
+Controls: joystick moves the player. A = short pass, B = shoot (hold longer = more power / long ball), C = sprint. When defending: chase the ball carrier, hold C to sprint, tap A to switch player or tackle. When attacking: carry the ball toward the goal you attack, dribble (zigzag) past defenders, pass to a free teammate, shoot when near the box with a clear angle.
+Plan the next 3 moves in order (the game keeps moving, so keep each move simple). Reply ONLY with JSON: {"attack":"left"|"right"|"unknown" (side of the screen your team attacks),"steps":[{"angle":0-359 screen direction for the joystick (0=right,90=up,180=left,270=down),"power":0.3-1,"dribble":true/false,"btn":"A"|"B"|"C"|"none","hold":0-600 ms (for B),"ms":600-1400 how long this move lasts}, ...3 items...],"note":"3-word tactic"}"""
 
-    fun decide(key: String, b64: String, last: String): JSONArray? = try {
-        val img = JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", b64))
-        val txt = JSONObject().put("text", "Previous plan: $last. Plan the next 3 moves.")
-        val body = JSONObject()
-            .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
-            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(img).put(txt))))
-            .put("generationConfig", JSONObject().put("maxOutputTokens", 600).put("temperature", 0.7).put("responseMimeType", "application/json"))
-        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent").openConnection() as HttpURLConnection
-        c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 5000; c.readTimeout = 10000
-        c.setRequestProperty("x-goog-api-key", key)
-        c.setRequestProperty("content-type", "application/json")
-        c.outputStream.use { it.write(body.toString().toByteArray()) }
-        val t = JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("candidates").getJSONObject(0)
-            .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
-        val j = JSONObject(t.substring(t.indexOf('{'), t.lastIndexOf('}') + 1))
-        j.optJSONArray("steps") ?: JSONArray().put(j)
-    } catch (e: Exception) { null }
+    fun decide(key: String, b64: String, last: String): Pair<JSONArray?, String> {
+        if (key.isBlank()) return null to "Chưa nhập API key"
+        return try {
+            val img = JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", b64))
+            val txt = JSONObject().put("text", "Previous plan: $last. Plan the next 3 moves.")
+            val body = JSONObject()
+                .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
+                .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(img).put(txt))))
+                .put("generationConfig", JSONObject().put("maxOutputTokens", 600).put("temperature", 0.7).put("responseMimeType", "application/json"))
+            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/${MODELS[mi]}:generateContent").openConnection() as HttpURLConnection
+            c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 5000; c.readTimeout = 10000
+            c.setRequestProperty("x-goog-api-key", key)
+            c.setRequestProperty("content-type", "application/json")
+            c.outputStream.use { it.write(body.toString().toByteArray()) }
+            val code = c.responseCode
+            if (code != 200) {
+                val err = (c.errorStream?.bufferedReader()?.readText() ?: "").replace("\n", " ").take(60)
+                val tried = MODELS[mi]
+                if ((code == 404 || code == 400) && err.contains("model", true) && mi < MODELS.size - 1) mi++
+                return null to "HTTP $code $tried: $err"
+            }
+            val t = JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("candidates").getJSONObject(0)
+                .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+            val j = JSONObject(t.substring(t.indexOf('{'), t.lastIndexOf('}') + 1))
+            val arr = j.optJSONArray("steps") ?: JSONArray().put(j)
+            if (arr.length() > 0) arr.getJSONObject(0).put("attack", j.optString("attack", "unknown"))
+            arr to "OK"
+        } catch (e: Exception) { null to ("Lỗi: " + e.message).take(80) }
+    }
 }
