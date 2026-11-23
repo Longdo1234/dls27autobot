@@ -24,53 +24,47 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.*
 import kotlin.random.Random
 
-// Một cụm điểm ảnh đỏ = một cầu thủ đội mình (toạ độ pixel màn hình)
-class Blob(val x: Float, val y: Float, val n: Int)
+// Một biểu tượng cầu thủ trên minimap (toạ độ trong ảnh đã cắt đúng vùng minimap)
+class Blob(val x: Float, val y: Float, val n: Int, val x0: Int, val x1: Int, val y0: Int, val y1: Int)
 
-// Lớp phủ trong suốt: vòng xanh lá = cầu thủ đang điều khiển, vòng vàng = đồng đội áo đỏ,
-// chấm trắng = điểm bóng, dải xanh lơ = phía khung thành đối thủ. Nó cũng lọt vào ảnh gửi AI.
+// Kết quả đọc minimap
+class Radar(
+    val w: Int, val h: Int,
+    val reds: List<Blob>,              // cầu thủ áo đỏ (đội mình)
+    val opps: List<Blob>,              // cầu thủ đội kia
+    val mine: Blob?,                   // áo đỏ có vầng sáng = đội mình đang cầm bóng
+    val foreign: Pair<Float, Float>?   // vầng sáng không dính áo đỏ = đối phương cầm bóng hoặc bóng lỏng
+)
+
+// Dải xanh lơ ở mép màn hình = phía khung thành đối thủ (không đụng vào vùng minimap)
 class Hud(ctx: Context) : View(ctx) {
-    @Volatile var blobs: List<Blob> = emptyList()
-    @Volatile var me: Blob? = null
-    @Volatile var ref: Pair<Float, Float>? = null
     @Volatile var attack = 0
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     override fun onDraw(c: Canvas) {
-        p.style = Paint.Style.STROKE
-        for (b in blobs) {
-            val isMe = b === me
-            p.strokeWidth = if (isMe) 10f else 6f
-            p.color = if (isMe) 0xFF00FF00.toInt() else 0xFFFFEB3B.toInt()
-            c.drawCircle(b.x, b.y, if (isMe) 75f else 55f, p)
-        }
-        ref?.let { p.strokeWidth = 5f; p.color = Color.WHITE; c.drawCircle(it.first, it.second, 16f, p) }
-        if (attack != 0) {
-            p.style = Paint.Style.FILL; p.color = 0x8800E5FF.toInt()
-            val bw = width * 0.05f
-            if (attack > 0) {
-                c.drawRect(width - bw, height * 0.2f, width.toFloat(), height * 0.8f, p)
-            } else {
-                c.drawRect(0f, height * 0.2f, bw, height * 0.8f, p)
-            }
+        if (attack == 0) return
+        p.style = Paint.Style.FILL; p.color = 0x8800E5FF.toInt()
+        val bw = width * 0.05f
+        if (attack > 0) {
+            c.drawRect(width - bw, height * 0.2f, width.toFloat(), height * 0.8f, p)
+        } else {
+            c.drawRect(0f, height * 0.2f, bw, height * 0.8f, p)
         }
     }
 }
 
 class BotService : AccessibilityService() {
-    private val TICK = 380L        // chu kỳ chụp + đọc màn hình
-    private val SEG = 1000L        // độ dài mỗi đoạn kéo joystick
+    private val TICK = 380L        // chu kỳ chụp + đọc minimap
+    private val SEG = 800L         // độ dài mỗi cử chỉ
     private val RAD = Math.PI / 180
-    private val HOLD_IN = 0.08f    // cầu thủ cách điểm bóng < 8% chiều cao màn hình -> coi là có bóng
-    private val HOLD_OUT = 0.11f   // xa hơn 11% -> coi là mất bóng
     private val PASS_MIN = 70L     // chuyền gần: chạm nhẹ (ms giữ B). Chuyền yếu quá thì tăng
     private val PASS_MAX = 520L    // chuyền xa: giữ lâu nhất (ms). Chuyền mạnh quá thì giảm
-    private val MIN_N = 20         // số điểm ảnh đỏ tối thiểu của một cầu thủ (ảnh đã thu nhỏ 1/2)
 
     private val io = Executors.newSingleThreadExecutor()
     private val pool = Executors.newFixedThreadPool(3)
     private val ui = Handler(Looper.getMainLooper())
     private var tv: TextView? = null
     private var panel: View? = null
+    private var panelLp: WindowManager.LayoutParams? = null
     private var hud: Hud? = null
     private var spBtn: Button? = null
     private lateinit var wm: WindowManager
@@ -81,14 +75,8 @@ class BotService : AccessibilityService() {
     @Volatile private var running = false
     @Volatile private var fast = false
     @Volatile private var pauseUntil = 0L
-    // AI (chậm): chỉ báo vùng sân + hướng tấn công
-    @Volatile private var aiStamp = 0L
-    @Volatile private var aiZone = "mid"
     @Volatile private var aiMsg = "chờ AI"
-    // minimap (nhanh)
     @Volatile private var attack = 0          // -1 tấn công trái, +1 tấn công phải, 0 chưa rõ
-    @Volatile private var advance = 0.5f      // 0 = sát khung thành nhà, 1 = sát khung thành đối thủ
-    @Volatile private var mapMsg = "chưa đặt"
     private val votes = CopyOnWriteArrayList<Int>()
     private val inflight = AtomicInteger(0)
     // trạng thái điều khiển (chỉ vòng lặp chính dùng)
@@ -101,7 +89,13 @@ class BotService : AccessibilityService() {
     private var switchUntil = 0L
     private var slideUntil = 0L
     private var noPressUntil = 0L
-    private var hasLocal = true
+    private var hasBall = true
+    private var lostTicks = 0
+    private var lastCarrier: Pair<Float, Float>? = null
+    // hàng đợi cử chỉ: chỉ 1 cử chỉ chạy một lúc, không bao giờ ngắt giữa chừng (tránh kẹt/liệt nút)
+    @Volatile private var busy = false
+    @Volatile private var busySince = 0L
+    private var pendingG: GestureDescription? = null
 
     private class Tactic(
         val name: String,
@@ -114,7 +108,6 @@ class BotService : AccessibilityService() {
     )
 
     private fun status(s: String) { ui.post { tv?.text = s } }
-    private fun hide(h: Boolean) { ui.post { panel?.visibility = if (h) View.INVISIBLE else View.VISIBLE } }
 
     @Synchronized private fun addVote(v: Int, n: Int) {
         repeat(n) { votes.add(v) }
@@ -125,14 +118,12 @@ class BotService : AccessibilityService() {
 
     override fun onServiceConnected() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        // lớp phủ HUD (không nhận chạm)
         val h = Hud(this)
         hud = h
         wm.addView(h, WindowManager.LayoutParams(-1, -1, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT))
-        // thanh điều khiển: nút to, không còn bị ẩn liên tục nên bấm dễ hơn
         fun mk(t: String) = Button(this).apply { text = t; textSize = 18f; minWidth = 120; minHeight = 100; setPadding(10, 0, 10, 0) }
         val l = LinearLayout(this).apply { setBackgroundColor(0xAA000000.toInt()) }
         val go = mk("▶")
@@ -147,20 +138,15 @@ class BotService : AccessibilityService() {
         sp.setOnClickListener { fast = !fast; sp.text = if (fast) "⚡" else "🐢" }
         spBtn = sp
         l.addView(sp)
-        // 🎯: bấm khi cầu thủ bạn đang cầm bóng để bot nhớ vị trí "cầm bóng" trên màn hình
-        l.addView(mk("🎯").apply {
-            setOnClickListener {
-                pool.execute {
-                    val b = shoot(true)
-                    if (b == null) status("Chụp lỗi") else { saveRef(b); b.recycle() }
-                }
-            }
-        })
         tv = TextView(this).apply { setTextColor(Color.WHITE); textSize = 10f; maxLines = 3; maxWidth = 600; text = "Sẵn sàng" }
         l.addView(tv)
         panel = l
-        wm.addView(l, WindowManager.LayoutParams(-2, -2, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START })
+        val lp = WindowManager.LayoutParams(-2, -2, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT)
+        lp.gravity = Gravity.TOP or Gravity.START
+        panelLp = lp
+        wm.addView(l, lp)
+        placePanel()
     }
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
     override fun onInterrupt() { running = false }
@@ -171,15 +157,13 @@ class BotService : AccessibilityService() {
     }
     private fun jrad() = min(bounds().width(), bounds().height()) * 0.12f
     private fun rn(x: Float) = Random.nextFloat() * 2 * x - x
-    private fun refPoint(): Pair<Float, Float> =
-        prefs.getFloat("rx", bounds().width() / 2f) to prefs.getFloat("ry", bounds().height() / 2f)
 
-    private fun saveRef(bmp: Bitmap) {
-        val cx = bounds().width() / 2f; val cy = bounds().height() / 2f
-        val b = findRed(bmp).minByOrNull { hypot(it.x - cx, it.y - cy) }
-        if (b == null) { status("Không thấy áo đỏ để lưu"); return }
-        prefs.edit().putFloat("rx", b.x).putFloat("ry", b.y).apply()
-        status("Đã lưu điểm cầm bóng")
+    // Đặt thanh điều khiển ở góc đối diện minimap để không che minimap
+    private fun placePanel() {
+        val lp = panelLp ?: return
+        val (x1, _) = pt(4); val (x2, _) = pt(5)
+        lp.gravity = if ((x1 + x2) / 2f < bounds().width() / 2f) Gravity.TOP or Gravity.END else Gravity.TOP or Gravity.START
+        ui.post { panel?.let { wm.updateViewLayout(it, lp) } }
     }
 
     // ---- Tool setup: JOY, A, B, C và khung minimap (MAP1 góc trên-trái, MAP2 góc dưới-phải) ----
@@ -202,7 +186,7 @@ class BotService : AccessibilityService() {
                     p.color = Color.WHITE; c.drawText(names[i], pts[i * 2], pts[i * 2 + 1] + 14, p)
                 }
                 p.textSize = 30f
-                c.drawText("Kéo MAP1, MAP2 phủ khung minimap; B phải nằm đúng nút B trong game", width / 2f, height - 30f, p)
+                c.drawText("Kéo MAP1, MAP2 ôm sát sân trong minimap (bot chỉ đọc vùng này); A, B, C đúng nút trong game", width / 2f, height - 30f, p)
                 p.textSize = 40f
                 p.color = 0xFF4CAF50.toInt(); c.drawRect(width / 2f - 120, 20f, width / 2f + 120, 110f, p)
                 p.color = Color.WHITE; c.drawText("LƯU", width / 2f, 80f, p)
@@ -212,7 +196,9 @@ class BotService : AccessibilityService() {
                     MotionEvent.ACTION_DOWN -> {
                         if (e.y < 110 && abs(e.x - width / 2f) < 120) {
                             prefs.edit().apply { for (i in 0..5) { putFloat("x$i", pts[i * 2]); putFloat("y$i", pts[i * 2 + 1]) } }.apply()
-                            wm.removeView(this); return true
+                            wm.removeView(this)
+                            placePanel()
+                            return true
                         }
                         sel = (0..5).minByOrNull { hypot(pts[it * 2] - e.x, pts[it * 2 + 1] - e.y) } ?: -1
                     }
@@ -226,32 +212,32 @@ class BotService : AccessibilityService() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT))
     }
 
-    // ---- Vòng lặp chính: chụp -> nhận diện (minimap + áo đỏ) -> (thỉnh thoảng) hỏi AI -> điều khiển ----
+    // ---- Vòng lặp chính: chụp CHỈ vùng minimap -> đọc -> (thỉnh thoảng) hỏi AI -> điều khiển ----
     private fun loop() {
-        votes.clear(); attack = 0; aiStamp = 0; aiZone = "mid"; aiMsg = "chờ AI"
-        tac = null; segEnd = 0; shotUntil = 0; crossUntil = 0; hasLocal = true; switchUntil = 0; slideUntil = 0; noPressUntil = 0
+        votes.clear(); attack = 0; aiMsg = "chờ AI"
+        tac = null; segEnd = 0; shotUntil = 0; crossUntil = 0; switchUntil = 0; slideUntil = 0; noPressUntil = 0
+        hasBall = true; lostTicks = 0; lastCarrier = null
         var lastAi = 0L
         while (running) {
             val t0 = System.currentTimeMillis()
-            val needAi = t0 >= pauseUntil && t0 - lastAi >= (if (fast) 800L else 4400L) && inflight.get() < 3
-            val bmp = shoot(needAi)   // chỉ ẩn thanh điều khiển khi chụp ảnh gửi AI
-            if (bmp == null) { status("Chụp màn hình lỗi"); Thread.sleep(400); continue }
+            val map = grabMap()
+            if (map == null) { status("Chưa chụp được minimap (bấm ⚙ đặt MAP1/MAP2)"); Thread.sleep(500); continue }
             try {
                 val now = System.currentTimeMillis()
-                val H = bounds().height().toFloat()
-                readMap(bmp)
-                val blobs = findRed(bmp)
-                val ref = refPoint()
-                val me = blobs.minByOrNull { hypot(it.x - ref.first, it.y - ref.second) }
-                val dist = if (me == null) 9999f else hypot(me.x - ref.first, me.y - ref.second)
-                val prevHas = hasLocal
-                if (me != null) hasLocal = if (prevHas) dist <= H * HOLD_OUT else dist <= H * HOLD_IN
-                hud?.let { it.blobs = blobs; it.me = me; it.ref = ref; it.attack = attack; it.postInvalidate() }
-
-                if (needAi) {
+                val rd = scan(map)
+                voteAttack(rd)
+                hud?.let { it.attack = attack; it.postInvalidate() }
+                val prev = hasBall
+                if (rd.mine != null) {
+                    hasBall = true; lostTicks = 0
+                } else {
+                    lostTicks++
+                    if (rd.foreign != null || lostTicks >= 2) hasBall = false
+                }
+                if (now >= pauseUntil && now - lastAi >= (if (fast) 800L else 4400L) && inflight.get() < 3) {
                     lastAi = now
                     val key = prefs.getString("key", "") ?: ""
-                    val b64 = jpeg(bmp)
+                    val b64 = jpeg(map)
                     val hint = when (attack) { 1 -> "right"; -1 -> "left"; else -> "unknown" }
                     inflight.incrementAndGet()
                     pool.execute {
@@ -265,8 +251,6 @@ class BotService : AccessibilityService() {
                                 }
                                 return@execute
                             }
-                            aiZone = d.optString("zone", "mid")
-                            aiStamp = System.currentTimeMillis()
                             when (d.optString("attack")) { "right" -> addVote(1, 2); "left" -> addVote(-1, 2) }
                         } catch (e: Exception) {
                             aiMsg = ("Lỗi: " + e.message).take(40)
@@ -276,149 +260,148 @@ class BotService : AccessibilityService() {
                     }
                 }
                 // mất/được bóng thì quyết định lại NGAY, còn lại đổi đoạn mỗi ~0,8 giây
-                if (hasLocal != prevHas || now >= segEnd - TICK) {
-                    control(now, me, blobs, ref, hasLocal, dist)
+                if (hasBall != prev || now >= segEnd - TICK) {
+                    control(now, rd)
                     segEnd = now + SEG
                 }
             } finally {
-                bmp.recycle()
+                map.recycle()
             }
             val el = System.currentTimeMillis() - t0
             if (el < TICK) Thread.sleep(TICK - el)
         }
-        hud?.let { it.blobs = emptyList(); it.me = null; it.attack = 0; it.postInvalidate() }
+        hud?.let { it.attack = 0; it.postInvalidate() }
+        synchronized(this) { pendingG = null }
         status("Đã dừng")
     }
 
-    private fun shoot(hidePanel: Boolean): Bitmap? {
+    // Chụp màn hình rồi CẮT NGAY vùng minimap, bỏ phần còn lại
+    private fun grabMap(): Bitmap? {
+        val (x1, y1) = pt(4); val (x2, y2) = pt(5)
         var out: Bitmap? = null
-        if (hidePanel) { hide(true); Thread.sleep(80) }
-        try {
-            val latch = CountDownLatch(1)
-            takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
-                override fun onSuccess(r: ScreenshotResult) {
-                    try {
-                        out = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)!!.copy(Bitmap.Config.ARGB_8888, false)
-                        r.hardwareBuffer.close()
-                    } catch (e: Exception) {}
-                    latch.countDown()
-                }
-                override fun onFailure(code: Int) { latch.countDown() }
-            })
-            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
-        } finally {
-            if (hidePanel) hide(false)
-        }
+        val latch = CountDownLatch(1)
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+            override fun onSuccess(r: ScreenshotResult) {
+                try {
+                    val full = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)!!.copy(Bitmap.Config.ARGB_8888, false)
+                    r.hardwareBuffer.close()
+                    val sx = full.width / bounds().width().toFloat()
+                    val sy = full.height / bounds().height().toFloat()
+                    val l = (min(x1, x2) * sx).toInt().coerceIn(0, full.width - 2)
+                    val rr = (max(x1, x2) * sx).toInt().coerceIn(l + 1, full.width)
+                    val t = (min(y1, y2) * sy).toInt().coerceIn(0, full.height - 2)
+                    val b = (max(y1, y2) * sy).toInt().coerceIn(t + 1, full.height)
+                    if (rr - l >= 30 && b - t >= 15) {
+                        val crop = Bitmap.createBitmap(full, l, t, rr - l, b - t)
+                        if (crop !== full) full.recycle()
+                        out = crop
+                    } else {
+                        full.recycle()
+                    }
+                } catch (e: Exception) {}
+                latch.countDown()
+            }
+            override fun onFailure(code: Int) { latch.countDown() }
+        })
+        latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
         return out
     }
 
     private fun jpeg(bmp: Bitmap): String {
-        val sc = Bitmap.createScaledBitmap(bmp, 960, bmp.height * 960 / bmp.width, true)
-        val bo = ByteArrayOutputStream(); sc.compress(Bitmap.CompressFormat.JPEG, 60, bo)
+        val sw = 480
+        val sh = max(1, bmp.height * sw / bmp.width)
+        val sc = Bitmap.createScaledBitmap(bmp, sw, sh, true)
+        val bo = ByteArrayOutputStream(); sc.compress(Bitmap.CompressFormat.JPEG, 80, bo)
         return Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP)
     }
 
-    // ---- Tìm cầu thủ áo đỏ trên màn hình (bỏ qua vùng HUD trên cùng, minimap và các nút điều khiển) ----
-    private fun findRed(bmp: Bitmap): List<Blob> {
-        val st = 2
-        val sw = bmp.width / st; val sh = bmp.height / st
-        val sm = Bitmap.createScaledBitmap(bmp, sw, sh, false)
-        val px = IntArray(sw * sh)
-        sm.getPixels(px, 0, sw, 0, 0, sw, sh)
-        sm.recycle()
-        val kx = bounds().width().toFloat() / bmp.width
-        val top = bounds().height() * 0.12f
-        val (m1x, m1y) = pt(4); val (m2x, m2y) = pt(5)
-        val jr = jrad()
-        val zones = (0..3).map { i ->
-            val z = pt(i)
-            Triple(z.first, z.second, if (i == 0) jr * 1.5f else jr * .9f)
-        }
-        fun excluded(x: Float, y: Float): Boolean {
-            if (y < top) return true
-            if (x >= min(m1x, m2x) - 10 && x <= max(m1x, m2x) + 10 && y >= min(m1y, m2y) - 10 && y <= max(m1y, m2y) + 10) return true
-            for (z in zones) if (hypot(x - z.first, y - z.second) < z.third) return true
-            return false
-        }
-        val cell = 8
-        val gw = sw / cell + 1; val gh = sh / cell + 1
-        val cnt = IntArray(gw * gh); val sxs = LongArray(gw * gh); val sys = LongArray(gw * gh)
-        for (y in 0 until sh) for (x in 0 until sw) {
-            val c = px[y * sw + x]
+    // ---- Đọc minimap: áo đỏ = đội mình, màu khác = đối thủ, vầng sáng trắng/hồng = người cầm bóng ----
+    private fun scan(bmp: Bitmap): Radar {
+        val w = bmp.width; val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        val red = BooleanArray(w * h); val opp = BooleanArray(w * h); val glw = BooleanArray(w * h)
+        for (i in px.indices) {
+            val c = px[i]
             val cr = (c shr 16) and 255; val cg = (c shr 8) and 255; val cb = c and 255
-            if (cr < 140 || cg > 110 || cb > 110 || cr - cg < 70) continue
-            if (excluded(x * st * kx, y * st * kx)) continue
-            val i = (y / cell) * gw + (x / cell)
-            cnt[i]++; sxs[i] += x.toLong(); sys[i] += y.toLong()
+            if (cr >= 215 && cg >= 130 && cb >= 130) { glw[i] = true; continue }
+            if (cr >= 140 && cg <= 110 && cb <= 110 && cr - cg >= 70) { red[i] = true; continue }
+            val top = max(cr, max(cg, cb)); val low = min(cr, min(cg, cb))
+            if (top - low < 80) continue
+            val redDom = cr == top && cg * 4 <= cr * 3 && cb * 4 <= cr * 3
+            val greenDom = cg == top && cg > cr && cg > cb
+            if (!redDom && !greenDom) opp[i] = true
         }
-        val seen = BooleanArray(gw * gh)
-        val stack = IntArray(gw * gh)
+        val reds = blobsOf(red, w, h, 5)
+        val opps = blobsOf(opp, w, h, 5)
+        // vầng sáng dính vào áo đỏ nào nhiều nhất -> đội mình đang cầm bóng
+        var mine: Blob? = null
+        var bestG = 0
+        val attached = BooleanArray(w * h)
+        for (r in reds) {
+            val ex = ((r.x1 - r.x0 + 1) * 0.6f).toInt() + 2
+            val ey = ((r.y1 - r.y0 + 1) * 0.6f).toInt() + 2
+            var cnt = 0
+            for (y in max(0, r.y0 - ey)..min(h - 1, r.y1 + ey)) for (x in max(0, r.x0 - ex)..min(w - 1, r.x1 + ex)) {
+                if (glw[y * w + x]) { cnt++; attached[y * w + x] = true }
+            }
+            if (cnt > bestG) { bestG = cnt; mine = r }
+        }
+        if (bestG < 4) mine = null
+        var fN = 0; var fx = 0L; var fy = 0L
+        for (i in glw.indices) if (glw[i] && !attached[i]) { fN++; fx += i % w; fy += i / w }
+        val foreign = if (fN >= 4) Pair(fx.toFloat() / fN, fy.toFloat() / fN) else null
+        return Radar(w, h, reds, opps, mine, foreign)
+    }
+
+    private fun blobsOf(mask: BooleanArray, w: Int, h: Int, minN: Int): List<Blob> {
+        val seen = BooleanArray(w * h)
+        val stack = IntArray(w * h)
         val out = ArrayList<Blob>()
-        for (s in 0 until gw * gh) {
-            if (cnt[s] < 3 || seen[s]) continue
+        for (s in mask.indices) {
+            if (!mask[s] || seen[s]) continue
             var sp = 0
             stack[sp++] = s; seen[s] = true
-            var n = 0; var tx = 0L; var ty = 0L
+            var n = 0; var sx = 0L; var sy = 0L
+            var x0 = w; var x1 = 0; var y0 = h; var y1 = 0
             while (sp > 0) {
                 val i = stack[--sp]
-                n += cnt[i]; tx += sxs[i]; ty += sys[i]
-                val cx = i % gw; val cy = i / gw
+                val x = i % w; val y = i / w
+                n++; sx += x; sy += y
+                if (x < x0) x0 = x
+                if (x > x1) x1 = x
+                if (y < y0) y0 = y
+                if (y > y1) y1 = y
                 for (dy in -1..1) for (dx in -1..1) {
-                    val nx = cx + dx; val ny = cy + dy
-                    if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue
-                    val j = ny * gw + nx
-                    if (!seen[j] && cnt[j] >= 3) { seen[j] = true; stack[sp++] = j }
+                    val nx = x + dx; val ny = y + dy
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+                    val j = ny * w + nx
+                    if (mask[j] && !seen[j]) { seen[j] = true; stack[sp++] = j }
                 }
             }
-            if (n >= MIN_N) out.add(Blob(tx.toFloat() / n * st * kx, ty.toFloat() / n * st * kx, n))
+            if (n >= minN) out.add(Blob(sx.toFloat() / n, sy.toFloat() / n, n, x0, x1, y0, y1))
         }
         return out
     }
 
-    // ---- Đọc minimap: chấm đỏ = đội mình, chấm màu khác (không xám/xanh lá) = đối thủ ----
-    private fun readMap(bmp: Bitmap) {
-        val sx = bmp.width / bounds().width().toFloat()
-        val sy = bmp.height / bounds().height().toFloat()
-        val (x1, y1) = pt(4); val (x2, y2) = pt(5)
-        val l = (min(x1, x2) * sx).toInt().coerceIn(0, bmp.width - 2)
-        val r = (max(x1, x2) * sx).toInt().coerceIn(l + 1, bmp.width)
-        val t = (min(y1, y2) * sy).toInt().coerceIn(0, bmp.height - 2)
-        val b = (max(y1, y2) * sy).toInt().coerceIn(t + 1, bmp.height)
-        val w = r - l; val h = b - t
-        if (w < 30 || h < 15) { mapMsg = "kéo MAP1/MAP2 phủ minimap"; return }
-        val px = IntArray(w * h)
-        bmp.getPixels(px, 0, w, l, t, w, h)
-        var rMin = w; var rMax = -1; var rSum = 0L; var rN = 0
-        var oMin = w; var oMax = -1; var oSum = 0L; var oN = 0
-        for (y in 0 until h) for (x in 0 until w) {
-            val c = px[y * w + x]
-            val cr = (c shr 16) and 255; val cg = (c shr 8) and 255; val cb = c and 255
-            if (max(cr, max(cg, cb)) - min(cr, min(cg, cb)) < 80) continue
-            if (cr >= 150 && cg <= 100 && cb <= 100) {
-                if (x < rMin) rMin = x
-                if (x > rMax) rMax = x
-                rSum += x; rN++
-            } else if (!(cg > cr && cg > cb)) {
-                if (x < oMin) oMin = x
-                if (x > oMax) oMax = x
-                oSum += x; oN++
-            }
-        }
-        if (rN < 6 || oN < 6) { mapMsg = "không thấy chấm đỏ/đối thủ"; return }
+    // Hướng tấn công: đội nào có người sát mép trái/phải minimap (thủ môn) là đội phòng ngự bên đó
+    private fun voteAttack(rd: Radar) {
+        if (rd.reds.size < 2 || rd.opps.size < 2) return
+        val w = rd.w
+        val rMin = rd.reds.minOf { it.x0 }; val rMax = rd.reds.maxOf { it.x1 }
+        val oMin = rd.opps.minOf { it.x0 }; val oMax = rd.opps.maxOf { it.x1 }
         val tol = w * 0.03
         val left = if (rMin < oMin - tol) 1 else if (oMin < rMin - tol) -1 else 0
         val right = if (rMax > oMax + tol) 1 else if (oMax > rMax + tol) -1 else 0
-        val mr = rSum.toDouble() / rN; val mo = oSum.toDouble() / oN
+        val mr = rd.reds.map { it.x.toDouble() }.average()
+        val mo = rd.opps.map { it.x.toDouble() }.average()
         if (left == 1 && right == -1) {
-            addVote(1, 2)         // thủ môn nhà bên trái -> tấn công phải
+            addVote(1, 2)        // thủ môn nhà bên trái -> tấn công phải
         } else if (left == -1 && right == 1) {
-            addVote(-1, 2)        // thủ môn nhà bên phải -> tấn công trái
+            addVote(-1, 2)       // thủ môn nhà bên phải -> tấn công trái
         } else if (abs(mr - mo) > w * 0.08) {
             addVote(if (mr < mo) 1 else -1, 1)
         }
-        val cx = (mr / w).toFloat()
-        advance = if (attack >= 0) cx else 1f - cx
-        mapMsg = "đỏ $rN / đối thủ $oN"
     }
 
     // ---- Thư viện rê bóng (d = hướng tấn công: +1 phải, -1 trái) ----
@@ -461,21 +444,24 @@ class BotService : AccessibilityService() {
         return best
     }
 
-    // ---- Quyết định: mất bóng -> ĐÈ B + kéo joystick; gần khung thành -> sút; dạt cánh -> tạt; còn lại chuyền ban bật / rê ----
-    private fun control(now: Long, me: Blob?, blobs: List<Blob>, ref: Pair<Float, Float>, has: Boolean, dist: Float) {
-        val W = bounds().width().toFloat(); val H = bounds().height().toFloat()
+    // ---- Quyết định: mất bóng -> ĐÈ B + joystick; gần khung thành -> sút (A); dạt cánh -> tạt (C); còn lại chuyền ban bật (B) / rê ----
+    private fun control(now: Long, rd: Radar) {
+        val w = rd.w.toFloat(); val h = rd.h.toFloat()
         val d = if (attack != 0) attack else 1
         val head = if (d > 0) "→" else "←"
-        val info = "MAP $mapMsg | AI $aiMsg | d=${(dist / H * 100).toInt()}%"
-        if (me == null) {
-            status("Không thấy áo đỏ\n$info")
-            val k0 = tac
-            if (k0 != null && now - tacStart <= k0.dur) emit(k0, tacBase, now - tacStart)
-            return
-        }
+        val who = if (hasBall) "mình" else if (rd.foreign != null) "kia" else "?"
+        val info = "đỏ ${rd.reds.size} | kia ${rd.opps.size} | bóng $who | AI $aiMsg"
+        if (rd.reds.isEmpty()) { status("Không thấy áo đỏ trên minimap\n$info"); return }
+        val me = rd.mine
+        val carrier: Pair<Float, Float>? = if (me != null) Pair(me.x, me.y) else (rd.foreign ?: lastCarrier)
+        if (carrier != null) lastCarrier = carrier
+
         // 1) MẤT BÓNG: đè B + kéo joystick (kèm bóng); xa bóng thì bấm C đổi cầu thủ, sát người giữ bóng thì A xoạc
-        if (!has) {
-            val a = atan2((me.y - ref.second).toDouble(), (ref.first - me.x).toDouble())
+        if (!hasBall || me == null) {
+            if (carrier == null) { status("Chưa thấy bóng\n$info"); return }
+            val chaser = rd.reds.minByOrNull { hypot(it.x - carrier.first, it.y - carrier.second) } ?: return
+            val a = atan2((chaser.y - carrier.second).toDouble(), (carrier.first - chaser.x).toDouble())
+            val dist = hypot(chaser.x - carrier.first, chaser.y - carrier.second) / w
             tac = null
             if (now <= noPressUntil) {          // vừa chuyền/sút/tạt: bóng rời chân là bình thường, chưa ép
                 status("Theo bóng\n$info")
@@ -483,9 +469,9 @@ class BotService : AccessibilityService() {
                 return
             }
             val taps = ArrayList<Triple<Int, Long, Long>>()
-            if (dist > H * .2f && now > switchUntil) {
+            if (dist > .22f && now > switchUntil) {
                 taps.add(Triple(3, 30L, 60L)); switchUntil = now + 2500
-            } else if (dist < H * .16f && now > slideUntil && Random.nextFloat() < .3f) {
+            } else if (dist < .09f && now > slideUntil && Random.nextFloat() < .3f) {
                 taps.add(Triple(1, 250L, 60L)); slideUntil = now + 2500
             }
             val extra = if (taps.isEmpty()) "" else if (taps[0].first == 3) " + đổi người (C)" else " + xoạc (A)"
@@ -493,12 +479,12 @@ class BotService : AccessibilityService() {
             emit(Tactic("Ép sát", 1000, taps = taps, press = true), a, 0)
             return
         }
-        val fresh = now - aiStamp < (if (fast) 3000L else 6500L)
-        val zone = if (fresh) aiZone else "mid"
-        val up = me.y < H / 2f
+
+        val up = me.y < h / 2f
         val side = if (up) 1.0 else -1.0
-        // 2) GẦN KHUNG THÀNH: sút
-        if ((zone == "goal" || advance >= .8f) && now > shotUntil) {
+        val adv = if (d > 0) me.x / w else 1f - me.x / w   // 0 = sát khung thành nhà, 1 = sát khung thành đối thủ
+        // 2) GẦN KHUNG THÀNH: sút (A)
+        if (adv >= .8f && now > shotUntil) {
             val tilt = (if (up) -d else d) * 12 * RAD
             val t1 = Tactic("SÚT gần khung thành", 900, taps = listOf(Triple(1, 150L, 350L)))
             tac = t1; tacStart = now; tacBase = (if (d > 0) 0.0 else Math.PI) + tilt; shotUntil = now + 1800; noPressUntil = now + 2000
@@ -513,8 +499,8 @@ class BotService : AccessibilityService() {
             emit(k1, tacBase, now - tacStart)
             return
         }
-        // 4) DẠT CÁNH: chạy dọc biên rồi tạt vào
-        if (zone == "wing" && now > crossUntil) {
+        // 4) DẠT CÁNH (sát biên minimap, nửa sân trên): chạy dọc biên rồi tạt (C)
+        if ((me.y < h * .2f || me.y > h * .8f) && adv > .45f && adv < .8f && now > crossUntil) {
             val inward = -side * d * 38 * RAD
             val t2 = Tactic("Tạt cánh", 1800, off = { t -> if (t < 0.9f) 0.0 else inward },
                 taps = listOf(Triple(3, 1000L, 200L)))
@@ -523,11 +509,11 @@ class BotService : AccessibilityService() {
             emit(t2, tacBase, 0)
             return
         }
-        // 5) CHUYỀN BAN BẬT liên tục
-        val mate = pickMate(me, blobs, d, W, H)
+        // 5) CHUYỀN BAN BẬT liên tục (B), lực theo khoảng cách
+        val mate = pickMate(me, rd.reds, d, w, h)
         if (mate != null && Random.nextFloat() < .65f) {
             val a = atan2((me.y - mate.y).toDouble(), (mate.x - me.x).toDouble())
-            val hold = passHold(hypot(mate.x - me.x, mate.y - me.y), W, H)
+            val hold = passHold(hypot(mate.x - me.x, mate.y - me.y), w, h)
             val t3 = Tactic("Chuyền ${hold}ms", 900, taps = listOf(Triple(2, 220L, hold)), steady = true)
             tac = t3; tacStart = now; tacBase = a; noPressUntil = now + 1500
             status("${t3.name} $head\n$info")
@@ -541,7 +527,7 @@ class BotService : AccessibilityService() {
         emit(t4, tacBase, 0)
     }
 
-    // Một đoạn cử chỉ: joystick kéo theo đường cong của chiến thuật + các nút bấm cùng lúc (đa điểm chạm)
+    // Dựng một cử chỉ: joystick kéo theo đường cong của chiến thuật + các nút bấm cùng lúc (đa điểm chạm)
     private fun emit(tc: Tactic, base: Double, rel: Long) {
         val (jx, jy) = pt(0); val jr = jrad()
         val path = Path()
@@ -560,21 +546,41 @@ class BotService : AccessibilityService() {
             g.addStroke(GestureDescription.StrokeDescription(
                 Path().apply { moveTo(bx + rn(6f), by + rn(6f)) }, start, hold.coerceAtLeast(40)))
         }
-        for ((b, s, h) in tc.taps) if (s >= rel && s < rel + SEG) btn(b, s - rel, if (tc.steady) h else h + Random.nextLong(-20, 40))
+        for ((b, s, hd) in tc.taps) if (s >= rel && s < rel + SEG) btn(b, s - rel, if (tc.steady) hd else hd + Random.nextLong(-20, 40))
         if (tc.press) btn(2, Random.nextLong(40, 120), SEG - 160)
-        if (!dispatchGesture(g.build(), null, null)) status("Hệ thống từ chối cử chỉ")
+        send(g.build())
+    }
+
+    // Chỉ một cử chỉ chạy một lúc. Lệnh mới đến lúc đang bận thì xếp hàng (giữ lệnh mới nhất),
+    // chờ cử chỉ trước kết thúc + nghỉ 40ms cho ngón nhả hẳn. Không bao giờ ngắt giữa chừng -> không kẹt nút.
+    @Synchronized private fun send(g: GestureDescription) {
+        val now = System.currentTimeMillis()
+        if (busy && now - busySince > 3000) busy = false   // phòng khi hệ thống không báo kết thúc
+        if (busy) { pendingG = g; return }
+        busy = true; busySince = now
+        val ok = dispatchGesture(g, object : GestureResultCallback() {
+            override fun onCompleted(d: GestureDescription?) { release() }
+            override fun onCancelled(d: GestureDescription?) { release() }
+        }, null)
+        if (!ok) { busy = false; status("Hệ thống từ chối cử chỉ") }
+    }
+
+    private fun release() {
+        ui.postDelayed({
+            var n: GestureDescription? = null
+            synchronized(this) { busy = false; n = pendingG; pendingG = null }
+            val next = n
+            if (next != null && running) send(next)
+        }, 40)
     }
 }
 
 object Ai {
     private val MODELS = arrayOf("gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash")
     @Volatile private var mi = 0
-    private const val SYS = """You watch one landscape screenshot of Dream League Soccer. Ignore the small overlay buttons at the top-left corner and the on-screen touch controls.
-My team wears RED shirts; the other color is the opponent. I added markings: a GREEN ring = the red player I control (he holds or chases the ball), YELLOW rings = my other red players, a small white circle = where the ball usually is, a CYAN bar on the left or right screen edge = the side of the opponents' goal that my team attacks (it may be missing).
-Answer two things:
-- attack: the side of the screen ("left" or "right") of the goal my red team attacks, i.e. the goal defended by the opponents' goalkeeper. Teams swap sides at half time, so decide from THIS screenshot; a recent estimate is given as a hint, keep it unless the screenshot clearly shows otherwise; "unknown" if unsure.
-- zone: where the green-ring player is: "goal" = inside or right at the edge of the opponent penalty area (shooting range); "wing" = close to the touchline in the attacking half (a cross is possible); "mid" = anywhere else in the attacking half or midfield; "own" = in my own half.
-Reply ONLY with JSON: {"attack":"left"|"right"|"unknown","zone":"own"|"mid"|"wing"|"goal"}"""
+    private const val SYS = """You see a cropped image of the small radar/minimap of a Dream League Soccer match (a top-down view of the pitch). My team's players are RED icons; the other team's players have another color. A bright white or pink glow on an icon marks the player holding the ball. Goalkeepers stand near the two short ends of the pitch.
+Answer one thing: attack = the side of the image ("left" or "right") toward which my red team attacks, i.e. the end of the pitch where the opponents' goalkeeper stands. Teams swap ends at half time. A recent estimate is given as a hint: keep it unless the image clearly shows otherwise; "unknown" if unsure.
+Reply ONLY with JSON: {"attack":"left"|"right"|"unknown"}"""
 
     fun decide(key: String, b64: String, hint: String): Pair<JSONObject?, String> {
         if (key.isBlank()) return null to "Chưa nhập API key"
@@ -584,7 +590,7 @@ Reply ONLY with JSON: {"attack":"left"|"right"|"unknown","zone":"own"|"mid"|"win
             val body = JSONObject()
                 .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
                 .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(img).put(txt))))
-                .put("generationConfig", JSONObject().put("maxOutputTokens", 100).put("temperature", 0.2).put("responseMimeType", "application/json"))
+                .put("generationConfig", JSONObject().put("maxOutputTokens", 60).put("temperature", 0.1).put("responseMimeType", "application/json"))
             val c = URL("https://generativelanguage.googleapis.com/v1beta/models/${MODELS[mi]}:generateContent").openConnection() as HttpURLConnection
             c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 5000; c.readTimeout = 10000
             c.setRequestProperty("x-goog-api-key", key)
