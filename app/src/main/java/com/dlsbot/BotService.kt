@@ -279,9 +279,13 @@ class BotService : AccessibilityService() {
         val left = if (rMin < oMin - tol) 1 else if (oMin < rMin - tol) -1 else 0
         val right = if (rMax > oMax + tol) 1 else if (oMax > rMax + tol) -1 else 0
         val mr = rSum.toDouble() / rN; val mo = oSum.toDouble() / oN
-        if (left == 1 && right == -1) addVote(1, 2)         // thủ môn nhà bên trái -> tấn công phải
-        else if (left == -1 && right == 1) addVote(-1, 2)   // thủ môn nhà bên phải -> tấn công trái
-        else if (abs(mr - mo) > w * 0.08) addVote(if (mr < mo) 1 else -1, 1)
+        if (left == 1 && right == -1) {
+            addVote(1, 2)         // thủ môn nhà bên trái -> tấn công phải
+        } else if (left == -1 && right == 1) {
+            addVote(-1, 2)        // thủ môn nhà bên phải -> tấn công trái
+        } else if (abs(mr - mo) > w * 0.08) {
+            addVote(if (mr < mo) 1 else -1, 1)
+        }
         val cx = (mr / w).toFloat()
         advance = if (attack >= 0) cx else 1f - cx
         mapMsg = "đỏ $rN / đối thủ $oN"
@@ -337,8 +341,11 @@ class BotService : AccessibilityService() {
             return
         }
         if (ok && has && me != null && to != null && (act == "shoot" || act == "pass")) {
-            val t2 = if (act == "shoot") Tactic("SÚT", 900, taps = listOf(Triple(2, 120L, 380L)))
-                     else Tactic("CHUYỀN", 800, taps = listOf(Triple(1, 120L, 60L)))
+            val t2 = if (act == "shoot") {
+                Tactic("SÚT", 900, taps = listOf(Triple(2, 120L, 380L)))
+            } else {
+                Tactic("CHUYỀN", 800, taps = listOf(Triple(1, 120L, 60L)))
+            }
             tac = t2; tacStart = now; tacBase = ang(me, to); lastHas = true
             status("${t2.name}\nMAP ${mapMsg} | AI ${aiMsg}")
             emit(t2, tacBase, 0)
@@ -418,4 +425,9 @@ Reply ONLY with JSON in this order: {"ball":[x,y],"me":[x,y],"hasBall":true|fals
                 if ((code == 404 || code == 400) && err.contains("model", true) && mi < MODELS.size - 1) mi++
                 return null to "HTTP $code $tried: $err"
             }
-            val
+            val t = JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("candidates").getJSONObject(0)
+                .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+            JSONObject(t.substring(t.indexOf('{'), t.lastIndexOf('}') + 1)) to "OK"
+        } catch (e: Exception) { null to ("Lỗi: " + e.message).take(40) }
+    }
+}
