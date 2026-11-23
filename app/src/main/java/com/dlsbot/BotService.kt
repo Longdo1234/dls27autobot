@@ -57,21 +57,26 @@ class Hud(ctx: Context) : View(ctx) {
 
 class BotService : AccessibilityService() {
     private val TICK = 380L        // chu kỳ chụp + đọc minimap
-    private val SEG = 800L         // độ dài mỗi cử chỉ
+    private val SEG = 500L         // độ dài mỗi đoạn cử chỉ (joystick liền mạch nên ngắn cũng không khựng)
     private val RAD = Math.PI / 180
     // ---- lực chuyền / sút (chỉ dùng nút B để chuyền) ----
     private val SHORT_PASS_MS = 400L   // chuyền ngắn: nhấp B 0,4 giây
     private val LONG_PASS_MIN = 700L   // chuyền dài: đè B, từ ... (ms)
     private val LONG_PASS_MAX = 1200L  // ... đến ... (ms), xa hơn thì đè lâu hơn
     private val SHORT_MAX_M = 20f      // đồng đội cách <= 20m thì chuyền ngắn, xa hơn thì chuyền dài
-    private val SHOT_MS = 400L         // sút: giữ A 0,4 giây
+    // ---- lực sút theo thanh lực (Calibrated Shot Power Curve): 0,4s ≈ 45% => thanh đầy ≈ 0,89s ----
+    private val FULL_BAR_MS = 890L         // thời gian đè A để đầy thanh lực; nếu cú sút luôn yếu/mạnh quá thì chỉnh số này
+    private fun pct(p: Int): Long = FULL_BAR_MS * p / 100
+    private val SHOT_MS = pct(45)          // A1 sút căng/cứa lòng góc xa: 40-50% lực (= 0,4s)
+    private val SHOT_LOW_MS = pct(20)      // A2 sút sệt chìm khi thủ môn lao ra: 15-25% lực
+    private val SHOT_LONG_MS = pct(60)     // sút xa ngoài vòng cấm: 55-65% lực
+    private val SHOT_MAX_BOX_MS = pct(65)  // trong vòng cấm 16m50 không bao giờ vượt 65% (quá tay dễ vọt xà)
+    private val SHOT_MAX_MS = pct(75)      // nơi khác không vượt 75%
     // kích thước sân thật để tính góc joystick đúng (minimap kéo dãn không làm lệch hướng)
     private val PITCH_L = 105f
     private val PITCH_W = 68f
     private val VF = 1f                // hệ số hướng dọc; nếu chuyền/sút luôn lệch lên/xuống thì chỉnh số này
     // ---- theo tài liệu chiến thuật DLS Offline ----
-    private val SHOT_LOW_MS = 400L     // sút sệt chìm khi thủ môn lao ra (tài liệu: nhấp nhẹ). Mặc định giữ 0,4s như bạn dặn
-    private val SHOT_POWER_MS = 400L   // sút căng/cứa lòng góc xa khi đang lệch góc. Mặc định giữ 0,4s
     private val GK_RUSH = true          // đối thủ đối mặt trong vòng cấm nhà: giữ C gọi thủ môn lao ra
     // vùng vuốt màn hình cho kỹ thuật cá nhân (tỉ lệ màn hình), chỉ dùng khi bật nút ✨
     private val SW_X = 0.62f
@@ -121,10 +126,27 @@ class BotService : AccessibilityService() {
     private var lastPassFrom: Pair<Float, Float>? = null
     private var lastPassAt = 0L
     private var lastCarrier: Pair<Float, Float>? = null
-    // hàng đợi cử chỉ: chỉ 1 cử chỉ chạy một lúc, không bao giờ ngắt giữa chừng (tránh kẹt/liệt nút)
+    // ---- cử chỉ liền mạch ----
+    // Joystick là MỘT nét chạm duy nhất được nối dài qua nhiều cử chỉ (continueStroke): ngón không nhả, không về tâm,
+    // đổi hướng theo cung cong nên không bị khựng. Chỉ một cử chỉ chạy một lúc và không bao giờ bị ngắt giữa chừng.
+    private class Step(val tc: Tactic, val base: Double, val rel: Long, val hold: Boolean = false, val release: Boolean = false)
     @Volatile private var busy = false
     @Volatile private var busySince = 0L
-    private var pendingG: GestureDescription? = null
+    private val queue = ArrayList<Step>()
+    private var lastStep: Step? = null
+    private var lastEnd = 0L
+    private var lastTotal = 0L
+    private var buildCont = false
+    private var replays = 0
+    private var joyStroke: GestureDescription.StrokeDescription? = null
+    private var btnStroke: GestureDescription.StrokeDescription? = null
+    private var joyX = 0f
+    private var joyY = 0f
+    private var joyA = 0.0
+    private var btnX = 0f
+    private var btnY = 0f
+    @Volatile private var cont = true      // false = chế độ cũ (nhả ngón mỗi đoạn); tự chuyển sang khi chế độ liền mạch bị lỗi 3 lần
+    private var contFails = 0
 
     private class Tactic(
         val name: String,
@@ -138,6 +160,7 @@ class BotService : AccessibilityService() {
         val press: Boolean = false
     ) {
         fun withSwipe(sw: Triple<Int, Int, Long>) = Tactic(name + " + vuốt", dur, off, pw, taps, steady, seg, sw, press)
+        fun noTaps() = Tactic(name, dur, off, pw, emptyList(), steady, seg, null, press)
     }
 
     private class PassPick(val m: Blob, val score: Float, val progress: Float, val dist: Float)
@@ -192,6 +215,7 @@ class BotService : AccessibilityService() {
     }
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
     override fun onInterrupt() { running = false }
+    override fun onDestroy() { running = false; releaseChain(); super.onDestroy() }
 
     private fun bounds() = wm.currentWindowMetrics.bounds
     private fun pt(i: Int): Pair<Float, Float> = bounds().let {
@@ -335,7 +359,8 @@ class BotService : AccessibilityService() {
             if (el < TICK) Thread.sleep(TICK - el)
         }
         hud?.let { it.attack = 0; it.postInvalidate() }
-        synchronized(this) { pendingG = null }
+        synchronized(this) { queue.clear(); replays = 99 }
+        releaseChain()
         status("Đã dừng")
     }
 
@@ -499,7 +524,7 @@ class BotService : AccessibilityService() {
     // Chọn đồng đội để chuyền (chỉ nút B): tiến về phía trước, đường chuyền không bị chặn, người nhận không bị kèm.
     // Thưởng thêm: ban bật trả ngược cho người vừa chuyền, chọc khe sau lưng hàng thủ, đổi cánh khi bị vây.
     // cutBack = chỉ xét đồng đội gần chấm phạt đền (chuyền ngược tuyến hai từ sát biên ngang).
-    private fun choosePass(me: Blob, reds: List<Blob>, opps: List<Blob>, d: Int, w: Float, h: Float, cutBack: Boolean): PassPick? {
+    private fun choosePass(me: Blob, reds: List<Blob>, opps: List<Blob>, d: Int, w: Float, h: Float, cutBack: Boolean, tight: Boolean): PassPick? {
         var best: PassPick? = null
         val crowd = opps.count { dm(me.x, me.y, it.x, it.y, w, h) < 12f }
         // hàng thủ thứ hai từ cuối (bỏ thủ môn) = đường lưng hậu vệ
@@ -528,6 +553,7 @@ class BotService : AccessibilityService() {
             if (from != null && System.currentTimeMillis() - lastPassAt < 2500 &&
                 dm(m.x, m.y, from.first, from.second, w, h) < 15f) s += 18f   // ban bật trả ngược
             if (crowd >= 3 && abs(m.y - me.y) / h * PITCH_W > 25f && near > 8f) s += 25f   // bị vây: đổi cánh
+            if (tight && dist < 18f) s += 12f                                              // bị ép sát: chuyền một chạm cho người gần
             if (s > (best?.score ?: -1e9f)) best = PassPick(m, s, progress, dist)
         }
         return best?.takeIf { it.score > -10f }
@@ -570,7 +596,7 @@ class BotService : AccessibilityService() {
         val me = rd.mine
         val adv = if (me == null) -1f else if (d > 0) me.x / w else 1f - me.x / w   // 0 = sát khung thành nhà, 1 = sát khung thành đối thủ
         val zone = if (me == null) "" else " | tiến ${(adv * 100).toInt()}% ngang ${(me.y / h * 100).toInt()}%"
-        val info = "đỏ ${rd.reds.size} | kia ${rd.opps.size} | bóng $who$zone | AI $aiMsg"
+        var info = "đỏ ${rd.reds.size} | kia ${rd.opps.size} | bóng $who$zone | AI $aiMsg" + (if (cont) "" else " | chế độ cũ")
         if (rd.reds.isEmpty()) { status("Không thấy áo đỏ trên minimap\n$info"); return }
         val carrier: Pair<Float, Float>? = if (me != null) Pair(me.x, me.y) else (rd.foreign ?: lastCarrier)
         if (carrier != null) lastCarrier = carrier
@@ -606,7 +632,7 @@ class BotService : AccessibilityService() {
             val extra = (if (rush) " + gọi thủ môn (giữ C)" else if (taps.any { it.first == 3 }) " + đổi người (C)" else "") +
                 (if (taps.any { it.first == 1 }) " + xoạc (A)" else "")
             status("Ép sát: đè B$extra (${dist.toInt()}m)\n$info")
-            emit(Tactic("Ép sát", 1000, taps = taps, press = true, seg = 1000L), a, 0)
+            emit(Tactic("Ép sát", 600, taps = taps, press = true, seg = 600L), a, 0)
             return
         }
 
@@ -617,8 +643,16 @@ class BotService : AccessibilityService() {
         val lateral = abs(me.y - h / 2f) / h * PITCH_W
         val nearOpp = rd.opps.minOfOrNull { dm(me.x, me.y, it.x, it.y, w, h) } ?: 99f
         val pressured = nearOpp < 6f
-        val canShoot = dGoal <= 24f && lateral <= 20f
-        val goodShot = dGoal <= 20f && lateral <= 14f
+        // góc nhìn khung thành giữa hai cột dọc (độ): dưới 15 độ là góc hẹp -> không sút, mở góc hoặc chuyền
+        val halfGoal = h * (3.66f / PITCH_W)
+        val pa = pang(me.x, me.y, tx, h / 2f - halfGoal, w, h)
+        val pb = pang(me.x, me.y, tx, h / 2f + halfGoal, w, h)
+        var da = abs(pa - pb)
+        if (da > Math.PI) da = 2 * Math.PI - da
+        val narrow = Math.toDegrees(da) < 15.0
+        if (narrow && dGoal <= 24f) info += " [GÓC HẸP]"
+        val canShoot = dGoal <= 24f && lateral <= 20f && !narrow
+        val goodShot = dGoal <= 20f && lateral <= 14f && !narrow
         // nhắm góc xa, tránh thủ môn: thủ môn lệch bên nào thì sút bên kia
         val gk = rd.opps.filter { dm(it.x, it.y, tx, h / 2f, w, h) < 14f }.minByOrNull { dm(it.x, it.y, tx, h / 2f, w, h) }
         val gkOut = gk != null && abs(gk.x - tx) / w * PITCH_L > 6f     // thủ môn đã lao ra khỏi vạch vôi
@@ -641,15 +675,26 @@ class BotService : AccessibilityService() {
             emit(t3, tacBase, 0)
         }
 
-        // 2) SÚT: trong tầm, góc đẹp (hoặc đang bị ép), joystick ngắm thẳng vào góc khung thành.
-        //    Thủ môn lao ra -> sút sệt; lệch góc -> sút căng góc xa. (Thời gian giữ A chỉnh bằng SHOT_*_MS, mặc định 0,4s)
+        // 2) SÚT (nút A). Pha 1 xoay joystick về góc khung thành, pha 2 giữ nguyên hướng rồi mới bấm A.
+        //    Thủ môn lao ra: sút sệt A2 (20% lực). Sút xa: 60% lực. Còn lại A1: 45% lực (= 0,4s). Không bao giờ vượt ngưỡng quá lực.
+        val inBox = dGoal <= 16.5f
         if (canShoot && now > shotUntil && (goodShot || pressured)) {
-            val hold = if (gkOut) SHOT_LOW_MS else if (lateral > 10f) SHOT_POWER_MS else SHOT_MS
-            val nm = if (gkOut) "SÚT sệt (thủ môn ra)" else if (lateral > 10f) "SÚT căng góc xa" else "SÚT"
-            val t1 = Tactic("$nm ${hold}ms", 200L + hold + 100L, taps = listOf(Triple(1, 200L, hold)), steady = true)
+            var hold = if (gkOut) SHOT_LOW_MS else if (dGoal > 20f) SHOT_LONG_MS else SHOT_MS
+            hold = min(hold, if (inBox) SHOT_MAX_BOX_MS else SHOT_MAX_MS)
+            val nm = if (gkOut) "SÚT sệt A2" else if (dGoal > 20f) "SÚT xa" else "SÚT A1"
+            val t1 = Tactic("$nm ${hold * 100 / FULL_BAR_MS}% (${hold}ms)", 200L + hold + 100L, taps = listOf(Triple(1, 200L, hold)), steady = true)
             tac = t1; tacStart = now; tacBase = aim; shotUntil = now + 1800; noPressUntil = now + 1200
             status("${t1.name} $head\n$info")
             emit(t1, tacBase, 0)
+            return
+        }
+        // sút xa chính diện (20-30m, thoáng): đôi khi tung cú 60% lực
+        if (dGoal > 20f && dGoal <= 30f && lateral <= 12f && !narrow && !pressured && now > shotUntil && Random.nextFloat() < .3f) {
+            val hold = min(SHOT_LONG_MS, SHOT_MAX_MS)
+            val t8 = Tactic("SÚT xa ${hold * 100 / FULL_BAR_MS}% (${hold}ms)", 200L + hold + 100L, taps = listOf(Triple(1, 200L, hold)), steady = true)
+            tac = t8; tacStart = now; tacBase = aim; shotUntil = now + 1800; noPressUntil = now + 1200
+            status("${t8.name} $head\n$info")
+            emit(t8, tacBase, 0)
             return
         }
         // 3) đang chạy dở một chiến thuật thì làm tiếp
@@ -666,7 +711,7 @@ class BotService : AccessibilityService() {
         if (lateral > 22f && dGoal <= 45f && now > crossUntil && !repeatCross) {
             val near = dGoal <= 32f
             if (near) {
-                val cb = choosePass(me, rd.reds, rd.opps, d, w, h, true)
+                val cb = choosePass(me, rd.reds, rd.opps, d, w, h, true, false)
                 if (cb != null && cb.score > 0f) {
                     crossUntil = now + 3000
                     doPass(cb, "Cắt ngược ")
@@ -696,7 +741,7 @@ class BotService : AccessibilityService() {
             return
         }
         // 6) CHUYỀN THÔNG MINH: chọc khe sau lưng hàng thủ, ban bật trả ngược, đổi cánh khi bị vây, tránh đường bị chặn
-        val pk = choosePass(me, rd.reds, rd.opps, d, w, h, false)
+        val pk = choosePass(me, rd.reds, rd.opps, d, w, h, false, nearOpp < 4f)
         val oneTwo = System.currentTimeMillis() - lastPassAt < 2500 && Random.nextFloat() < .6f
         val wantPass = pk != null && ((pressured && Random.nextFloat() < .9f) || oneTwo || (pk.progress >= 8f && Random.nextFloat() < .5f) || Random.nextFloat() < .25f)
         if (pk != null && wantPass) {
@@ -717,30 +762,157 @@ class BotService : AccessibilityService() {
         emit(t4, tacBase, 0)
     }
 
-    // Dựng một cử chỉ: joystick kéo theo đường cong của chiến thuật + các nút bấm cùng lúc (đa điểm chạm).
-    // Nếu giữ nút lâu hơn SEG thì joystick cũng giữ đến hết, để hướng chuyền/sút còn nguyên lúc nhả nút.
+    // ======================= CỬ CHỈ LIỀN MẠCH =======================
+    // Control gọi emit() để đặt kế hoạch (thay thế hàng đợi); mỗi cử chỉ chỉ được dựng và gửi khi cử chỉ trước đã xong.
     private fun emit(tc: Tactic, base: Double, rel: Long) {
-        val (jx, jy) = pt(0); val jr = jrad()
+        val steps = ArrayList<Step>()
+        if (cont && tc.steady && tc.taps.isNotEmpty()) {
+            // chuyền/sút: pha 1 xoay joystick về đúng hướng (160ms), pha 2 giữ nguyên hướng rồi mới bấm nút
+            if (rel == 0L) steps.add(Step(Tactic(tc.name, 160L, steady = true, seg = 160L), base, 0L))
+            steps.add(Step(tc, base, rel, hold = true))
+        } else {
+            steps.add(Step(tc, base, rel))
+        }
+        synchronized(this) { queue.clear(); queue.addAll(steps); replays = 0 }
+        dispatchNext(false)
+    }
+
+    // nhả hẳn ngón khi dừng bot
+    private fun releaseChain() {
+        synchronized(this) {
+            if (joyStroke == null && btnStroke == null) return
+            queue.clear(); queue.add(Step(Tactic("nhả", 0L), 0.0, 0L, release = true))
+        }
+        dispatchNext(false)
+    }
+
+    @Synchronized private fun dispatchNext(fromCallback: Boolean) {
+        val now = System.currentTimeMillis()
+        if (busy && now - busySince > 3000) { busy = false; joyStroke = null; btnStroke = null }   // phòng khi hệ thống không báo kết thúc
+        if (busy) return
+        var next: Step? = if (queue.isEmpty()) null else queue.removeAt(0)
+        if (next == null) {
+            if (!fromCallback) return
+            if (joyStroke == null && btnStroke == null) return
+            val lt = lastStep
+            next = if (running && lt != null && replays < 2) {
+                replays++
+                Step(lt.tc.noTaps(), lt.base, lastEnd, hold = lt.hold)      // chưa có lệnh mới: giữ/kéo tiếp joystick, không bấm lại nút
+            } else {
+                Step(Tactic("nhả", 0L), 0.0, 0L, release = true)            // hết lệnh: nhả ngón
+            }
+        }
+        val step = next!!
+        val g = try { build(step) } catch (e: Exception) { null }
+        if (g == null) {
+            if (!step.release) { joyStroke = null; btnStroke = null; contFails++; if (contFails >= 3) cont = false }
+            return
+        }
+        if (!step.release) { lastStep = step; lastEnd = step.rel + lastTotal }
+        val isCont = buildCont
+        busy = true; busySince = now
+        val ok = dispatchGesture(g, object : GestureResultCallback() {
+            override fun onCompleted(d: GestureDescription?) { finished(true, isCont) }
+            override fun onCancelled(d: GestureDescription?) { finished(false, isCont) }
+        }, null)
+        if (!ok) {
+            busy = false; joyStroke = null; btnStroke = null
+            if (isCont) { contFails++; if (contFails >= 3) cont = false }
+            status("Hệ thống từ chối cử chỉ")
+        }
+    }
+
+    private fun finished(ok: Boolean, wasCont: Boolean) {
+        synchronized(this) {
+            busy = false
+            if (ok) {
+                if (wasCont) contFails = 0
+            } else {
+                joyStroke = null; btnStroke = null
+                if (wasCont) {
+                    contFails++
+                    if (contFails >= 3) { cont = false; status("Chế độ liền mạch lỗi: chuyển sang chế độ cũ") }
+                }
+            }
+        }
+        dispatchNext(true)
+    }
+
+    // Dựng một cử chỉ. Joystick: nét nối dài từ điểm cuối của đoạn trước, đổi hướng theo cung (giới hạn tốc độ xoay);
+    // nút bấm: các nét riêng trong cùng cử chỉ (đa điểm chạm); nút B khi ép sát cũng được nối dài để giữ liên tục.
+    private fun build(st: Step): GestureDescription? {
+        val tc = st.tc
+        val (cx, cy) = pt(0); val jr = jrad()
+        val g = GestureDescription.Builder()
+        val prevJ = if (cont) joyStroke else null
+        val prevB = if (cont) btnStroke else null
+        buildCont = prevJ != null
+        if (st.release) {
+            if (prevJ == null && prevB == null) return null
+            if (prevJ != null) { val p = Path(); p.moveTo(joyX, joyY); g.addStroke(prevJ.continueStroke(p, 0, 40, false)) }
+            if (prevB != null) { val p = Path(); p.moveTo(btnX, btnY); g.addStroke(prevB.continueStroke(p, 0, 40, false)) }
+            joyStroke = null; btnStroke = null
+            lastTotal = 40L
+            return g.build()
+        }
+        val rel = st.rel
         var total = if (tc.seg > 0) tc.seg else SEG
         for ((_, s, hd) in tc.taps) if (s >= rel && s < rel + total) total = max(total, (s - rel) + hd + 120)
+        lastTotal = total
         val path = Path()
-        val jit = if (tc.steady) 2f else 8f
-        path.moveTo(jx + rn(jit), jy + rn(jit))
-        for (k in 1..5) {
-            val t = (rel + k * total / 5) / 1000f
-            val a = base + tc.off(t) + (if (tc.steady) 0.0 else Math.toRadians(rn(4f).toDouble()))
-            val r = jr * tc.pw(t) * (if (tc.steady) 1f else .92f + Random.nextFloat() * .08f)
-            path.lineTo(jx + (cos(a) * r).toFloat(), jy - (sin(a) * r).toFloat())
+        var curX: Float
+        var curY: Float
+        var curA: Double
+        if (prevJ != null) { curX = joyX; curY = joyY; curA = joyA } else { curX = cx + rn(3f); curY = cy + rn(3f); curA = st.base }
+        path.moveTo(curX, curY)
+        if (!(st.hold && prevJ != null)) {
+            val n = if (tc.steady) 3 else 5
+            val maxTurn = (if (tc.steady) 1080.0 else 540.0) * RAD * (total / 1000.0 / n)
+            for (k in 1..n) {
+                val t = (rel + k * total / n) / 1000f
+                val tgt = st.base + tc.off(t) + (if (tc.steady) 0.0 else Math.toRadians(rn(4f).toDouble()))
+                var diff = tgt - curA
+                while (diff > Math.PI) diff -= 2 * Math.PI
+                while (diff < -Math.PI) diff += 2 * Math.PI
+                curA += diff.coerceIn(-maxTurn, maxTurn)
+                val r = jr * tc.pw(t) * (if (tc.steady) 1f else .92f + Random.nextFloat() * .08f)
+                curX = cx + (cos(curA) * r).toFloat(); curY = cy - (sin(curA) * r).toFloat()
+                path.lineTo(curX, curY)
+            }
         }
-        val g = GestureDescription.Builder()
-        g.addStroke(GestureDescription.StrokeDescription(path, 0, total))
+        val js = if (prevJ != null) prevJ.continueStroke(path, 0, total, cont) else GestureDescription.StrokeDescription(path, 0, total, cont)
+        g.addStroke(js)
+        if (cont) { joyStroke = js; joyX = curX; joyY = curY; joyA = curA } else { joyStroke = null }
+
         fun btn(i: Int, start: Long, hold: Long) {
             val (bx, by) = pt(i)
             g.addStroke(GestureDescription.StrokeDescription(
                 Path().apply { moveTo(bx + rn(6f), by + rn(6f)) }, start, hold.coerceAtLeast(40)))
         }
+        if (prevB != null && !tc.press) {
+            // rời chế độ ép sát: nhả B
+            val p = Path(); p.moveTo(btnX, btnY)
+            g.addStroke(prevB.continueStroke(p, 0, 40, false)); btnStroke = null
+        }
         for ((b, s, hd) in tc.taps) if (s >= rel && s < rel + total) btn(b, s - rel, if (tc.steady) hd else hd + Random.nextLong(-20, 40))
-        if (tc.press) btn(2, Random.nextLong(40, 120), total - 200)
+        if (tc.press) {
+            if (cont) {
+                val bs: GestureDescription.StrokeDescription
+                if (prevB != null) {
+                    val p = Path(); p.moveTo(btnX, btnY)
+                    bs = prevB.continueStroke(p, 0, total, true)
+                } else {
+                    val (bx, by) = pt(2)
+                    btnX = bx + rn(6f); btnY = by + rn(6f)
+                    val p = Path(); p.moveTo(btnX, btnY)
+                    val s0 = Random.nextLong(40, 120)
+                    bs = GestureDescription.StrokeDescription(p, s0, total - s0, true)
+                }
+                g.addStroke(bs); btnStroke = bs
+            } else {
+                btn(2, Random.nextLong(40, 120), total - 200)
+            }
+        }
         val swp = tc.swipe
         if (swp != null && swp.third >= rel && swp.third < rel + total) {
             val bw = bounds().width().toFloat(); val bh = bounds().height().toFloat()
@@ -750,30 +922,7 @@ class BotService : AccessibilityService() {
             sp.lineTo(sx0 + swp.first * SW_LEN * bw, sy0 + swp.second * SW_LEN * bw)
             g.addStroke(GestureDescription.StrokeDescription(sp, swp.third - rel, SW_MS))
         }
-        send(g.build())
-    }
-
-    // Chỉ một cử chỉ chạy một lúc. Lệnh mới đến lúc đang bận thì xếp hàng (giữ lệnh mới nhất),
-    // chờ cử chỉ trước kết thúc + nghỉ 40ms cho ngón nhả hẳn. Không bao giờ ngắt giữa chừng -> không kẹt nút.
-    @Synchronized private fun send(g: GestureDescription) {
-        val now = System.currentTimeMillis()
-        if (busy && now - busySince > 3000) busy = false   // phòng khi hệ thống không báo kết thúc
-        if (busy) { pendingG = g; return }
-        busy = true; busySince = now
-        val ok = dispatchGesture(g, object : GestureResultCallback() {
-            override fun onCompleted(d: GestureDescription?) { release() }
-            override fun onCancelled(d: GestureDescription?) { release() }
-        }, null)
-        if (!ok) { busy = false; status("Hệ thống từ chối cử chỉ") }
-    }
-
-    private fun release() {
-        ui.postDelayed({
-            var n: GestureDescription? = null
-            synchronized(this) { busy = false; n = pendingG; pendingG = null }
-            val next = n
-            if (next != null && running) send(next)
-        }, 40)
+        return g.build()
     }
 }
 
