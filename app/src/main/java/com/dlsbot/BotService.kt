@@ -27,7 +27,10 @@ import kotlin.math.*
 import kotlin.random.Random
 
 // Một biểu tượng cầu thủ trên minimap (toạ độ trong ảnh đã cắt đúng vùng minimap)
-class Blob(val x: Float, val y: Float, val n: Int, val x0: Int, val x1: Int, val y0: Int, val y1: Int)
+class Blob(val x: Float, val y: Float, val n: Int, val x0: Int, val x1: Int, val y0: Int, val y1: Int) {
+    var vx = 0f   // vận tốc (m/s theo mét sân) để chuyền đón đầu chỗ đồng đội sẽ chạy tới
+    var vy = 0f
+}
 
 // Kết quả đọc minimap
 class Radar(
@@ -60,18 +63,20 @@ class BotService : AccessibilityService() {
     private val SEG = 500L         // độ dài mỗi đoạn cử chỉ (joystick liền mạch nên ngắn cũng không khựng)
     private val RAD = Math.PI / 180
     // ---- lực chuyền / sút (chỉ dùng nút B để chuyền) ----
-    private val SHORT_PASS_MS = 400L   // chuyền ngắn: nhấp B 0,4 giây
+    private val FULL_BAR_MS = 890L         // thời gian đè A để đầy thanh lực; nếu cú sút luôn yếu/mạnh quá thì chỉnh số này
+    private val PASS_LO = pct(35)         // chuyền ngắn: 35% lực (đồng đội sát) ...
+    private val PASS_HI = pct(55)         // ... đến 55% lực (đồng đội cách ~20m); ~13m thì đúng 0,4s
+    private val SLIDE_ENABLED = false      // false = KHÔNG xoạc bằng A khi mất bóng (dễ hở sườn/phạt đền), chỉ đè B ép sát + C đổi người
     private val LONG_PASS_MIN = 700L   // chuyền dài: đè B, từ ... (ms)
     private val LONG_PASS_MAX = 1200L  // ... đến ... (ms), xa hơn thì đè lâu hơn
     private val SHORT_MAX_M = 20f      // đồng đội cách <= 20m thì chuyền ngắn, xa hơn thì chuyền dài
     // ---- lực sút theo thanh lực (Calibrated Shot Power Curve): 0,4s ≈ 45% => thanh đầy ≈ 0,89s ----
-    private val FULL_BAR_MS = 890L         // thời gian đè A để đầy thanh lực; nếu cú sút luôn yếu/mạnh quá thì chỉnh số này
     private fun pct(p: Int): Long = FULL_BAR_MS * p / 100
     private val SHOT_MS = pct(45)          // A1 sút căng/cứa lòng góc xa: 40-50% lực (= 0,4s)
-    private val SHOT_LOW_MS = pct(20)      // A2 sút sệt chìm khi thủ môn lao ra: 15-25% lực
-    private val SHOT_LONG_MS = pct(60)     // sút xa ngoài vòng cấm: 55-65% lực
     private val SHOT_MAX_BOX_MS = pct(65)  // trong vòng cấm 16m50 không bao giờ vượt 65% (quá tay dễ vọt xà)
     private val SHOT_MAX_MS = pct(75)      // nơi khác không vượt 75%
+    // khóa lực sút 42-48% thanh lực, tính lại mỗi cú
+    private fun shotHold(inBox: Boolean): Long = min(pct(Random.nextInt(42, 49)), if (inBox) SHOT_MAX_BOX_MS else SHOT_MAX_MS)
     // kích thước sân thật để tính góc joystick đúng (minimap kéo dãn không làm lệch hướng)
     private val PITCH_L = 105f
     private val PITCH_W = 68f
@@ -125,6 +130,9 @@ class BotService : AccessibilityService() {
     private val crossSides = ArrayList<Int>()       // các lần tạt gần nhất từ cánh nào
     private var lastPassFrom: Pair<Float, Float>? = null
     private var lastPassAt = 0L
+    private var sideStreak = 0                       // số lần chuyền ngang/lùi liên tiếp (tối đa 2)
+    private var prevReds: List<Blob> = emptyList()
+    private var prevT = 0L
     private var lastCarrier: Pair<Float, Float>? = null
     // ---- cử chỉ liền mạch ----
     // Joystick là MỘT nét chạm duy nhất được nối dài qua nhiều cử chỉ (continueStroke): ngón không nhả, không về tâm,
@@ -163,7 +171,7 @@ class BotService : AccessibilityService() {
         fun noTaps() = Tactic(name, dur, off, pw, emptyList(), steady, seg, null, press)
     }
 
-    private class PassPick(val m: Blob, val score: Float, val progress: Float, val dist: Float)
+    private class PassPick(val m: Blob, val score: Float, val progress: Float, val dist: Float, val tx: Float, val ty: Float)
 
     private fun status(s: String) { ui.post { tv?.text = s } }
 
@@ -302,6 +310,7 @@ class BotService : AccessibilityService() {
         tac = null; segEnd = 0; shotUntil = 0; crossUntil = 0; switchUntil = 0; slideUntil = 0; noPressUntil = 0
         hasBall = true; lostTicks = 0; gainTicks = 0; lastCarrier = null; justLost = false
         swipeUntil = 0; gkUntil = 0; recent.clear(); crossSides.clear(); lastPassFrom = null; lastPassAt = 0
+        sideStreak = 0; prevReds = emptyList(); prevT = 0
         var lastAi = 0L
         while (running) {
             val t0 = System.currentTimeMillis()
@@ -311,6 +320,7 @@ class BotService : AccessibilityService() {
                 val now = System.currentTimeMillis()
                 val rd = scan(map)
                 voteAttack(rd)
+                trackVel(rd.reds, now, rd.w.toFloat(), rd.h.toFloat())
                 hud?.let { it.attack = attack; it.postInvalidate() }
                 val prev = hasBall
                 if (rd.mine != null) {
@@ -321,7 +331,7 @@ class BotService : AccessibilityService() {
                     gainTicks = 0; lostTicks++
                     if (rd.oppHas || lostTicks >= 2) hasBall = false
                 }
-                if (prev && !hasBall) justLost = true
+                if (prev && !hasBall) { justLost = true; sideStreak = 0 }
                 if (now >= pauseUntil && now - lastAi >= (if (fast) 800L else 4400L) && inflight.get() < 3) {
                     lastAi = now
                     val key = prefs.getString("key", "") ?: ""
@@ -501,6 +511,21 @@ class BotService : AccessibilityService() {
         }
     }
 
+    // Vận tốc từng cầu thủ áo đỏ (ghép với vị trí gần nhất ở lần quét trước), làm mượt
+    private fun trackVel(reds: List<Blob>, now: Long, w: Float, h: Float) {
+        val dt = (now - prevT) / 1000f
+        if (prevReds.isNotEmpty() && dt > 0.15f && dt < 1.2f) {
+            for (b in reds) {
+                val p = prevReds.minByOrNull { dm(it.x, it.y, b.x, b.y, w, h) } ?: continue
+                if (dm(p.x, p.y, b.x, b.y, w, h) < 6f) {
+                    b.vx = 0.6f * ((b.x - p.x) / w * PITCH_L / dt) + 0.4f * p.vx
+                    b.vy = 0.6f * ((b.y - p.y) / h * PITCH_W / dt) + 0.4f * p.vy
+                }
+            }
+        }
+        prevReds = reds; prevT = now
+    }
+
     // ---- Hình học theo mét thật của sân (minimap bị kéo dãn cũng không lệch) ----
     private fun dm(ax: Float, ay: Float, bx: Float, by: Float, w: Float, h: Float): Float =
         hypot((bx - ax) / w * PITCH_L, (by - ay) / h * PITCH_W)
@@ -521,10 +546,12 @@ class BotService : AccessibilityService() {
         return Pair(t, hypot(apx - abx * tc, apy - aby * tc))
     }
 
-    // Chọn đồng đội để chuyền (chỉ nút B): tiến về phía trước, đường chuyền không bị chặn, người nhận không bị kèm.
-    // Thưởng thêm: ban bật trả ngược cho người vừa chuyền, chọc khe sau lưng hàng thủ, đổi cánh khi bị vây.
-    // cutBack = chỉ xét đồng đội gần chấm phạt đền (chuyền ngược tuyến hai từ sát biên ngang).
-    private fun choosePass(me: Blob, reds: List<Blob>, opps: List<Blob>, d: Int, w: Float, h: Float, cutBack: Boolean, tight: Boolean): PassPick? {
+    // Chọn đồng đội để chuyền (chỉ nút B): ưu tiên chuyền THẲNG LÊN, đường chuyền không bị chặn, người nhận không bị kèm.
+    // Chuyền vào chân chỗ đồng đội SẼ chạy tới (đón đầu theo vận tốc). Thưởng: chọc khe sau lưng hàng thủ, người đang bứt chạy chỗ,
+    // ban bật trả ngược, đổi cánh khi bị vây. noSide = đã chuyền ngang/lùi 2 nhịp liên tiếp -> chỉ xét đường chuyền tiến lên.
+    // cutBack = chỉ xét đồng đội gần chấm phạt đền.
+    private fun choosePass(me: Blob, reds: List<Blob>, opps: List<Blob>, d: Int, w: Float, h: Float,
+                           cutBack: Boolean, tight: Boolean, noSide: Boolean): PassPick? {
         var best: PassPick? = null
         val crowd = opps.count { dm(me.x, me.y, it.x, it.y, w, h) < 12f }
         // hàng thủ thứ hai từ cuối (bỏ thủ môn) = đường lưng hậu vệ
@@ -532,29 +559,42 @@ class BotService : AccessibilityService() {
         val line = if (xs.size >= 2) xs[1] else (if (d > 0) w else 0f)
         val spx = (if (d > 0) w else 0f) - d * w * (14f / PITCH_L)
         val from = lastPassFrom
+        val myAdv = if (d > 0) me.x / w else 1f - me.x / w
         for (m in reds) {
             if (m === me) continue
-            val dist = dm(me.x, me.y, m.x, m.y, w, h)
+            // đón đầu: bóng bay ~18 m/s, đồng đội chạy tiếp trong lúc đó
+            val d0 = dm(me.x, me.y, m.x, m.y, w, h)
+            val speed = hypot(m.vx, m.vy)
+            var lx = m.x
+            var ly = m.y
+            if (speed > 1.5f) {
+                val tf = d0 / 18f
+                lx = (m.x + m.vx * tf / PITCH_L * w).coerceIn(w * 0.02f, w * 0.98f)   // không để bóng trượt ra biên
+                ly = (m.y + m.vy * tf / PITCH_W * h).coerceIn(h * 0.02f, h * 0.98f)
+            }
+            val dist = dm(me.x, me.y, lx, ly, w, h)
             if (dist < 6f || dist > 45f) continue
-            if (cutBack && dm(m.x, m.y, spx, h / 2f, w, h) > 14f) continue
-            val progress = (m.x - me.x) / w * PITCH_L * d
+            if (cutBack && dm(lx, ly, spx, h / 2f, w, h) > 14f) continue
+            val progress = (lx - me.x) / w * PITCH_L * d
+            if (noSide && progress < 4f) continue
             var pen = 0f
             for (o in opps) {
-                val si = segInfo(me.x, me.y, m.x, m.y, o.x, o.y, w, h)
+                val si = segInfo(me.x, me.y, lx, ly, o.x, o.y, w, h)
                 if (si.first > 0.05f && si.first < 0.95f) {
                     if (si.second < 2.5f) pen += 1000f else if (si.second < 5f) pen += 25f * (5f - si.second)
                 }
             }
-            val near = opps.minOfOrNull { dm(m.x, m.y, it.x, it.y, w, h) } ?: 99f
+            val near = opps.minOfOrNull { dm(lx, ly, it.x, it.y, w, h) } ?: 99f
             if (near < 4f) pen += 30f * (4f - near)
-            var s = progress.coerceIn(-15f, 30f) * 0.8f - dist * 0.35f - pen + min(near, 10f) * 2f
-            val behind = (m.x - line) * d / w * PITCH_L            // mét phía sau lưng hàng thủ
-            if (behind >= 0f && behind <= 8f && near > 5f) s += 15f  // chọc khe
+            var s = progress.coerceIn(-15f, 30f) * 1.0f - dist * 0.35f - pen + min(near, 10f) * 2f
+            val behind = (lx - line) * d / w * PITCH_L              // mét phía sau lưng hàng thủ
+            if (behind >= 0f && behind <= 8f && near > 5f) s += 15f   // chọc khe
+            if (m.vx * d > 3f && myAdv > .45f) s += 12f              // đang bứt chạy chỗ về phía khung thành
             if (from != null && System.currentTimeMillis() - lastPassAt < 2500 &&
                 dm(m.x, m.y, from.first, from.second, w, h) < 15f) s += 18f   // ban bật trả ngược
-            if (crowd >= 3 && abs(m.y - me.y) / h * PITCH_W > 25f && near > 8f) s += 25f   // bị vây: đổi cánh
-            if (tight && dist < 18f) s += 12f                                              // bị ép sát: chuyền một chạm cho người gần
-            if (s > (best?.score ?: -1e9f)) best = PassPick(m, s, progress, dist)
+            if (crowd >= 3 && abs(ly - me.y) / h * PITCH_W > 25f && near > 8f) s += 25f   // bị vây: đổi cánh
+            if (tight && dist < 18f) s += 12f                         // bị ép sát: chuyền một chạm cho người gần
+            if (s > (best?.score ?: -1e9f)) best = PassPick(m, s, progress, dist, lx, ly)
         }
         return best?.takeIf { it.score > -10f }
     }
@@ -626,7 +666,7 @@ class BotService : AccessibilityService() {
                 taps.add(Triple(3, 30L, 60L)); switchUntil = now + 2500
             }
             justLost = false
-            if (!inMyBox && dist < 8f && now > slideUntil && Random.nextFloat() < .6f) {
+            if (SLIDE_ENABLED && !inMyBox && dist < 8f && now > slideUntil && Random.nextFloat() < .6f) {
                 taps.add(Triple(1, 250L, 60L)); slideUntil = now + 1400
             }
             val extra = (if (rush) " + gọi thủ môn (giữ C)" else if (taps.any { it.first == 3 }) " + đổi người (C)" else "") +
@@ -656,43 +696,63 @@ class BotService : AccessibilityService() {
         // nhắm góc xa, tránh thủ môn: thủ môn lệch bên nào thì sút bên kia
         val gk = rd.opps.filter { dm(it.x, it.y, tx, h / 2f, w, h) < 14f }.minByOrNull { dm(it.x, it.y, tx, h / 2f, w, h) }
         val gkOut = gk != null && abs(gk.x - tx) / w * PITCH_L > 6f     // thủ môn đã lao ra khỏi vạch vôi
-        val postOff = h * 0.03f
-        val ty = if (gk != null) (if (gk.y >= h / 2f) h / 2f - postOff else h / 2f + postOff) else (if (up) h / 2f + postOff else h / 2f - postOff)
+        val postOff = halfGoal * 0.75f      // góc chết: sát cột dọc (cột xa hoặc góc thấp)
+        var ty = if (gk != null) (if (gk.y >= h / 2f) h / 2f - postOff else h / 2f + postOff) else (if (up) h / 2f + postOff else h / 2f - postOff)
+        // không sút thẳng vào thủ môn: nếu thủ môn nằm trên đường sút thì đổi sang cột bên kia; cả hai đều bị chắn thì thôi
+        var gkBlocked = false
+        if (gk != null) {
+            val s1 = segInfo(me.x, me.y, tx, ty, gk.x, gk.y, w, h)
+            val s2 = segInfo(me.x, me.y, tx, h - ty, gk.x, gk.y, w, h)
+            val b1 = s1.first >= 0f && s1.first <= 1f && s1.second < 2.0f
+            val b2 = s2.first >= 0f && s2.first <= 1f && s2.second < 2.0f
+            if (b1 && !b2) ty = h - ty else if (b1 && b2) gkBlocked = true
+        }
+        val squeezed = rd.opps.count { it !== gk && dm(me.x, me.y, it.x, it.y, w, h) < 5f } >= 2   // bị 2 hậu vệ kẹp sát
         val aim = pang(me.x, me.y, tx, ty, w, h)
+        // vòng cấm 16m50 và có hậu vệ chắn trực diện không?
+        val inBoxArea = abs(me.x - tx) / w * PITCH_L <= 16.5f && lateral <= 20.2f
+        var frontBlocked = false
+        for (o in rd.opps) {
+            if (o === gk) continue
+            val si = segInfo(me.x, me.y, tx, ty, o.x, o.y, w, h)
+            if (si.first > 0f && si.first < 1f && si.second < 2.5f && dm(me.x, me.y, o.x, o.y, w, h) < 7f) { frontBlocked = true; break }
+        }
         val spx = tx - d * w * (14f / PITCH_L)               // chấm phạt đền
         val toSpot = pang(me.x, me.y, spx, h / 2f, w, h)
 
         // chuyền bằng nút B: nhấp 0,4s = ngắn; đồng đội xa thì đè B lâu hơn = dài
         fun doPass(pk: PassPick, tag: String) {
             val short = pk.dist <= SHORT_MAX_M
-            val hold = if (short) SHORT_PASS_MS else LONG_PASS_MIN + (((pk.dist - SHORT_MAX_M) / 25f).coerceIn(0f, 1f) * (LONG_PASS_MAX - LONG_PASS_MIN)).toLong()
-            val a = pang(me.x, me.y, pk.m.x, pk.m.y, w, h)
+            val hold = if (short) PASS_LO + (((pk.dist - 6f) / (SHORT_MAX_M - 6f)).coerceIn(0f, 1f) * (PASS_HI - PASS_LO)).toLong()
+                else LONG_PASS_MIN + (((pk.dist - SHORT_MAX_M) / 25f).coerceIn(0f, 1f) * (LONG_PASS_MAX - LONG_PASS_MIN)).toLong()
+            val a = pang(me.x, me.y, pk.tx, pk.ty, w, h)
             val t3 = Tactic(tag + (if (short) "ngắn " else "dài ") + hold + "ms", 200L + hold + 100L,
                 taps = listOf(Triple(2, 200L, hold)), steady = true)
-            tac = t3; tacStart = now; tacBase = a; noPressUntil = now + 600L + hold
+            tac = t3; tacStart = now; tacBase = a; noPressUntil = now + 300L + hold
             lastPassFrom = Pair(me.x, me.y); lastPassAt = now
+            if (pk.progress < 4f) sideStreak++ else sideStreak = 0
             status("${t3.name} (${pk.dist.toInt()}m) $head\n$info")
             emit(t3, tacBase, 0)
         }
 
-        // 2) SÚT (nút A). Pha 1 xoay joystick về góc khung thành, pha 2 giữ nguyên hướng rồi mới bấm A.
-        //    Thủ môn lao ra: sút sệt A2 (20% lực). Sút xa: 60% lực. Còn lại A1: 45% lực (= 0,4s). Không bao giờ vượt ngưỡng quá lực.
-        val inBox = dGoal <= 16.5f
-        if (canShoot && now > shotUntil && (goodShot || pressured)) {
-            var hold = if (gkOut) SHOT_LOW_MS else if (dGoal > 20f) SHOT_LONG_MS else SHOT_MS
-            hold = min(hold, if (inBox) SHOT_MAX_BOX_MS else SHOT_MAX_MS)
-            val nm = if (gkOut) "SÚT sệt A2" else if (dGoal > 20f) "SÚT xa" else "SÚT A1"
+        // 2) SÚT (nút A), khóa lực 42-48% thanh lực. Pha 1 xoay joystick (mũi chân trụ) về góc chết khung thành,
+        //    pha 2 giữ nguyên hướng rồi mới bấm A. Vào vòng cấm 16m50 mà không có hậu vệ chắn trực diện -> sút NGAY, không chuyền thêm.
+        //    Không sút thẳng vào thủ môn trừ khi bị 2 hậu vệ kẹp sát.
+        val shootOnSight = inBoxArea && !frontBlocked
+        if (canShoot && now > shotUntil && (goodShot || pressured || shootOnSight) && (!gkBlocked || squeezed)) {
+            val hold = shotHold(inBoxArea)
+            val nm = if (shootOnSight) "SÚT ngay (vòng cấm trống)" else if (gkOut) "SÚT góc thấp" else "SÚT góc xa"
             val t1 = Tactic("$nm ${hold * 100 / FULL_BAR_MS}% (${hold}ms)", 200L + hold + 100L, taps = listOf(Triple(1, 200L, hold)), steady = true)
-            tac = t1; tacStart = now; tacBase = aim; shotUntil = now + 1800; noPressUntil = now + 1200
+            tac = t1; tacStart = now; tacBase = aim; shotUntil = now + 1800; noPressUntil = now + 700; sideStreak = 0
             status("${t1.name} $head\n$info")
             emit(t1, tacBase, 0)
             return
         }
-        // sút xa chính diện (20-30m, thoáng): đôi khi tung cú 60% lực
-        if (dGoal > 20f && dGoal <= 30f && lateral <= 12f && !narrow && !pressured && now > shotUntil && Random.nextFloat() < .3f) {
-            val hold = min(SHOT_LONG_MS, SHOT_MAX_MS)
+        // sút xa chính diện (20-30m, thoáng): đôi khi tung cú, cùng lực 42-48%
+        if (dGoal > 20f && dGoal <= 30f && lateral <= 12f && !narrow && !pressured && !gkBlocked && now > shotUntil && Random.nextFloat() < .3f) {
+            val hold = shotHold(false)
             val t8 = Tactic("SÚT xa ${hold * 100 / FULL_BAR_MS}% (${hold}ms)", 200L + hold + 100L, taps = listOf(Triple(1, 200L, hold)), steady = true)
-            tac = t8; tacStart = now; tacBase = aim; shotUntil = now + 1800; noPressUntil = now + 1200
+            tac = t8; tacStart = now; tacBase = aim; shotUntil = now + 1800; noPressUntil = now + 700; sideStreak = 0
             status("${t8.name} $head\n$info")
             emit(t8, tacBase, 0)
             return
@@ -711,7 +771,7 @@ class BotService : AccessibilityService() {
         if (lateral > 22f && dGoal <= 45f && now > crossUntil && !repeatCross) {
             val near = dGoal <= 32f
             if (near) {
-                val cb = choosePass(me, rd.reds, rd.opps, d, w, h, true, false)
+                val cb = choosePass(me, rd.reds, rd.opps, d, w, h, true, false, sideStreak >= 2)
                 if (cb != null && cb.score > 0f) {
                     crossUntil = now + 3000
                     doPass(cb, "Cắt ngược ")
@@ -725,7 +785,7 @@ class BotService : AccessibilityService() {
                 Tactic("Tạt cánh", 1800, off = { t -> if (t < 0.9f) 0.0 else inward }, taps = listOf(Triple(3, 1000L, 200L)))
             }
             tac = t2; tacStart = now; tacBase = if (near) toSpot else (if (d > 0) 0.0 else Math.PI)
-            crossUntil = now + 3000; noPressUntil = now + 2000
+            crossUntil = now + 3000; noPressUntil = now + 1200
             crossSides.add(sInt); while (crossSides.size > 3) crossSides.removeAt(0)
             remember(t2.name)
             status("${t2.name} $head\n$info")
@@ -741,9 +801,9 @@ class BotService : AccessibilityService() {
             return
         }
         // 6) CHUYỀN THÔNG MINH: chọc khe sau lưng hàng thủ, ban bật trả ngược, đổi cánh khi bị vây, tránh đường bị chặn
-        val pk = choosePass(me, rd.reds, rd.opps, d, w, h, false, nearOpp < 4f)
+        val pk = choosePass(me, rd.reds, rd.opps, d, w, h, false, nearOpp < 4f, sideStreak >= 2)
         val oneTwo = System.currentTimeMillis() - lastPassAt < 2500 && Random.nextFloat() < .6f
-        val wantPass = pk != null && ((pressured && Random.nextFloat() < .9f) || oneTwo || (pk.progress >= 8f && Random.nextFloat() < .5f) || Random.nextFloat() < .25f)
+        val wantPass = pk != null && !(inBoxArea && pk.progress < 3f) && ((pressured && Random.nextFloat() < .9f) || oneTwo || (pk.progress >= 8f && Random.nextFloat() < .5f) || Random.nextFloat() < .25f)
         if (pk != null && wantPass) {
             doPass(pk, "Chuyền ")
             return
